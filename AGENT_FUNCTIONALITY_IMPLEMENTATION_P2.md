@@ -40,8 +40,8 @@ The assistant's architecture remains stable. The integrated model operates dynam
 
 **Tool Implementations:**
 - `src/proxima/agent/dynamic_tools/tools/filesystem_tools.py` (910 lines): `ReadFileTool`, `WriteFileTool`, `ListDirectoryTool`, `CreateDirectoryTool`, `DeleteFileTool`, `MoveFileTool`, `SearchFilesTool`, `FileInfoTool`. All registered via `@register_tool` decorator.
-- `src/proxima/agent/dynamic_tools/tools/git_tools.py` (850 lines): `GitStatusTool`, `GitCommitTool`, `GitBranchTool`, `GitLogTool`, `GitDiffTool`, `GitCheckoutTool`, `GitStashTool`. Uses `subprocess` for git command execution with 30-second timeouts.
-- `src/proxima/agent/dynamic_tools/tools/terminal_tools.py` (465 lines): `RunCommandTool`, `GetWorkingDirectoryTool`, `ChangeDirectoryTool`. Uses PowerShell on Windows, user's shell on Unix. Has `get_shell_info()` for cross-platform shell detection.
+- `src/proxima/agent/dynamic_tools/tools/git_tools.py` (850 lines): `GitStatusTool`, `GitCommitTool`, `GitBranchTool`, `GitLogTool`, `GitDiffTool`, `GitAddTool`. Uses `subprocess` for git command execution with 30-second timeouts. Note: there is no `GitCheckoutTool` or `GitStashTool` — checkout is handled via `GitBranchTool` (action="switch"), and stash goes through `RunCommandTool`.
+- `src/proxima/agent/dynamic_tools/tools/terminal_tools.py` (465 lines): `RunCommandTool`, `GetWorkingDirectoryTool`, `ChangeDirectoryTool`, `EnvironmentVariableTool`. Uses PowerShell on Windows, user's shell on Unix. Has `get_shell_info()` for cross-platform shell detection.
 
 **Agent Infrastructure:**
 - `src/proxima/agent/task_planner.py` (1,098 lines): LLM-based plan generation from natural language. Contains `TaskCategory` enum (BUILD, ANALYZE, MODIFY, EXECUTE, QUERY, GIT, FILE, SYSTEM), `PlanStep` dataclass with dependency tracking, `ExecutionPlan` dataclass with status tracking, and validation/feasibility checking.
@@ -533,7 +533,7 @@ Connect the `RobustNLProcessor`'s multi-step detection to the existing `TaskPlan
 1. `RobustNLProcessor.recognize_intent()` detects `MULTI_STEP` and fills `intent.sub_intents` with ordered sub-intents
 2. Create a method `_create_plan_from_intents(self, sub_intents: List[Intent]) -> ExecutionPlan` in the agent assistant that converts the list of `Intent` objects into a `TaskPlanner.ExecutionPlan`:
    - For each `Intent` in `sub_intents`, create a `PlanStep` with:
-     - `tool` = the tool name corresponding to the intent type (use the mapping from the `ToolDispatcher` — more on this in Step 3.3)
+     - `tool` = the tool name corresponding to the intent type (use the mapping from the `IntentToolBridge` — defined in Step 3.3)
      - `arguments` = extracted entities converted to tool parameters
      - `description` = a human-readable description of what the step does
      - `depends_on` = list of previous step IDs (sequential dependency by default)
@@ -561,11 +561,11 @@ The `IntentToolBridge` class must contain:
 - `IntentType.GIT_PUSH` → `"run_command"` (with `git push`)
 - `IntentType.GIT_COMMIT` → `"git_commit"` (from `git_tools.py`)
 - `IntentType.GIT_STATUS` → `"git_status"` (from `git_tools.py`)
-- `IntentType.GIT_CHECKOUT` → `"git_checkout"` (from `git_tools.py`)
+- `IntentType.GIT_CHECKOUT` → `"git_branch"` (from `git_tools.py` — `GitBranchTool` handles checkout/switch via its `action` param)
 - `IntentType.GIT_BRANCH` → `"git_branch"` (from `git_tools.py`)
 - `IntentType.GIT_LOG` → `"git_log"` (from `git_tools.py`)
 - `IntentType.GIT_DIFF` → `"git_diff"` (from `git_tools.py`)
-- `IntentType.GIT_STASH` → `"git_stash"` (from `git_tools.py`)
+- `IntentType.GIT_STASH` → `"run_command"` (with `git stash` as the command — no dedicated stash tool exists)
 - `IntentType.INSTALL_DEPENDENCY` → `"run_command"` (with pip/npm/conda command)
 - `IntentType.SEARCH_FILE` → `"search_files"` (from `filesystem_tools.py`)
 - `IntentType.ANALYZE_RESULTS` → custom handler (see Phase 9, Step 9.5)
@@ -697,11 +697,11 @@ In `IntentToolBridge`, for `RUN_SCRIPT` intents:
 1. Extract the `script_path` entity from the intent
 2. Call `resolve_path(script_path, context)` to get the absolute path
 3. Call `ScriptExecutor.detect_language(script_path)` to determine the interpreter
-4. Build the execution command:
-   - Python: use `ScriptExecutor.get_interpreter('python').path` + the script path
-   - PowerShell: use `powershell -NoProfile -File` + the script path
+4. Build the execution command. Use the `InterpreterRegistry` class (from `script_executor.py`) to look up interpreters — call `InterpreterRegistry.get_interpreter(ScriptLanguage.PYTHON)` (not `ScriptExecutor.get_interpreter`). The mapping:
+   - Python: `InterpreterRegistry.get_interpreter(ScriptLanguage.PYTHON).path` + the script path
+   - PowerShell: `powershell -NoProfile -File` + the script path
    - Bash: use the detected shell + the script path
-   - JavaScript: use `node` + the script path
+   - JavaScript: `node` + the script path
 5. Check if the script's directory contains a virtual environment (`venv/`, `.venv/`, `env/`). If so, prepend the activation command:
    - Windows: `& "{venv_path}\Scripts\Activate.ps1"; `
    - Unix: `source {venv_path}/bin/activate && `
@@ -770,10 +770,10 @@ The `DependencyManager` class must contain:
 **A method `detect_project_dependencies(project_path: str) -> Dict[str, Any]`** that scans a directory for dependency specification files and returns a structured description:
 1. Check for `requirements.txt` → parse it line by line, extracting package names and version constraints
 2. Check for `setup.py` → extract `install_requires` from the contents (regex-based extraction of the list)
-3. Check for `pyproject.toml` → parse using Python's `tomllib` (stdlib in Python 3.11+) or `tomli` library, extract `[project.dependencies]` and `[project.optional-dependencies]`
+3. Check for `pyproject.toml` → parse using Python's `tomllib` (stdlib since Python 3.11), extract `[project.dependencies]` and `[project.optional-dependencies]`
 4. Check for `setup.cfg` → parse using `configparser`, extract `install_requires` from `[options]`
 5. Check for `package.json` → parse as JSON, extract `dependencies` and `devDependencies`
-6. Check for `Pipfile` → parse using `tomllib`/`tomli`, extract `[packages]`
+6. Check for `Pipfile` → parse using `tomllib`, extract `[packages]`
 7. Check for `environment.yml` → parse using `pyyaml`, extract `dependencies`
 8. Return a dict with keys: `python_packages`, `node_packages`, `system_packages`, `source_file`, `detected_manager` (pip/conda/npm/yarn)
 
@@ -955,20 +955,20 @@ Before any code modification, create a `ConsentRequest` from `safety.py`:
 
 **Step 2 — Checkpoint Creation:**
 Before any modification:
-1. Call `CheckpointManager.create_checkpoint(operation="backend_modify", description="{backend_name}: {change_description}")` from `checkpoint_manager.py`
+1. Call `CheckpointManager.create_checkpoint(operation="backend_modify", description="{backend_name}: {change_description}", files=[file_path])` from `checkpoint_manager.py`
 2. The checkpoint captures: file path, full file content, SHA256 checksum, file metadata (size, permissions, mtime), and a backup copy at a timestamped path under `~/.proxima/checkpoints/`
 3. Store the checkpoint ID in `SessionContext.backend_checkpoints[backend_name]`
 4. Store affected file paths in `SessionContext.last_modified_files`
 
 **Step 3 — Modification Preview:**
-Before applying the change, show a diff preview using `ModificationPreview` from `modification_preview.py`:
+Before applying the change, show a diff preview using `ModificationPreviewGenerator` from `modification_preview.py` (which returns a `ModificationPreview` data object):
 1. Build a `CodeChange` object with the proposed modification:
    - `file_path`: the file being modified
    - `modification_type`: one of `ModificationType.REPLACE`, `INSERT`, `DELETE`, `APPEND`, `PREPEND`
    - `old_content`: the current content (or specific lines)
    - `new_content`: the proposed replacement
 2. Generate a diff via `CodeChange.get_diff()` — this produces a unified diff string
-3. Use `ModificationPreview` to format the diff with Rich syntax highlighting:
+3. Use `ModificationPreviewGenerator` to generate and format the diff with Rich syntax highlighting:
    - Green for additions, red for deletions, gray for context lines
    - Line numbers on both sides
 4. Display the formatted diff in the chat:
@@ -982,7 +982,7 @@ Before applying the change, show a diff preview using `ModificationPreview` from
 5. Wait for a second explicit approval before applying
 
 **Step 4 — Apply Modification:**
-1. Call `BackendModifier.apply_modification(code_change)` from `backend_modifier.py`
+1. Call `BackendModifier.apply_change(code_change)` from `backend_modifier.py`
 2. The modifier writes the new content to the file
 3. Verify the modification by reading the file back and comparing checksums
 4. Return a `ModificationResult` with `success`, `diff`, and the checkpoint ID
@@ -1002,7 +1002,7 @@ Before applying the change, show a diff preview using `ModificationPreview` from
 The undo/redo/rollback system leverages the existing `CheckpointManager` from `checkpoint_manager.py` and `RollbackManager` from `safety.py`.
 
 **Undo (intent `UNDO_OPERATION`):**
-1. Retrieve the most recent checkpoint from `CheckpointManager.get_latest_checkpoint()`
+1. Retrieve the most recent checkpoint from `CheckpointManager.list_checkpoints(limit=1)[0]` (the `checkpoint_manager.py` class does not have a `get_latest_checkpoint()` method — use `list_checkpoints()` which returns checkpoints newest-first)
 2. Display what will be undone:
    ```
    "↩️ Undo last operation: {checkpoint.operation}
@@ -1149,7 +1149,7 @@ In the `IntentToolBridge.dispatch()` method, before executing certain operations
 7. **CUDA/GPU operations**: installing CUDA toolkit, modifying GPU drivers, running `nvidia-smi` configuration
 
 When any of these patterns are detected:
-1. Call `AdminPrivilegeHandler.check_current_level()` to get the current `PrivilegeLevel`
+1. Call `AdminPrivilegeHandler.get_privilege_info().level` to get the current `PrivilegeLevel` (returns a `PrivilegeInfo` dataclass with `.level`, `.elevation_method`, and other fields)
 2. If already `ELEVATED` or `SYSTEM`, proceed directly
 3. If `STANDARD`, trigger the escalation flow in Step 7.2
 
@@ -1176,7 +1176,7 @@ Proceed with privilege escalation? (yes/no)"
 Create a `ConsentRequest` with `consent_type=ConsentType.ADMIN_ACCESS`, `risk_level='critical'`. Only proceed on explicit approval.
 
 **Step 2 — Determine escalation method:**
-Use `AdminPrivilegeHandler.get_elevation_method()` which detects the platform:
+Use `AdminPrivilegeHandler.get_privilege_info().elevation_method` which detects the platform:
 - **Windows**: `ElevationMethod.UAC` — use PowerShell `Start-Process -Verb RunAs` to launch an elevated process
 - **Linux/macOS with sudo**: `ElevationMethod.SUDO` — prepend `sudo` to the command
 - **Linux with pkexec**: `ElevationMethod.PKEXEC` — use `pkexec` (Polkit) if sudo is unavailable
@@ -1507,10 +1507,11 @@ Create a new file `src/proxima/agent/dynamic_tools/agent_loop.py`. This module i
 
 **The `AgentLoop` class contains:**
 
-**Constructor `__init__(self, nl_processor, tool_bridge, llm_router, session_context, ui_callback)`:**
+**Constructor `__init__(self, nl_processor, tool_bridge, llm_router, llm_tool_integration, session_context, ui_callback)`:**
 - `nl_processor`: the `RobustNLProcessor` instance
 - `tool_bridge`: the `IntentToolBridge` instance
-- `llm_router`: the LLM router instance (may be None if no LLM)
+- `llm_router`: the `LLMRouter` instance from `src/proxima/intelligence/llm_router.py` (may be None if no LLM is integrated). Provides `route()` and `route_with_fallback()` methods for sending requests to the configured LLM provider. Streaming is done at the provider level via `provider.stream_send()`.
+- `llm_tool_integration`: the `LLMToolIntegration` instance from `llm_integration.py` (may be None). Provides `parse_tool_calls()` for extracting structured tool calls from LLM responses.
 - `session_context`: the `SessionContext` instance
 - `ui_callback`: a callable that takes a message string and displays it in the TUI chat
 
@@ -1519,27 +1520,28 @@ This is the main entry point, called from `agent_ai_assistant.py` when the user 
 
 **Turn 1 — Intent Recognition:**
 1. Call `nl_processor.recognize_intent(message)` to get an `Intent`
-2. If intent confidence > 0.7 and intent is NOT `UNKNOWN`:
+2. If intent confidence >= 0.5 and intent is NOT `UNKNOWN`:
    - Execute the intent directly via `tool_bridge.dispatch(intent, context)`
    - Store the result
    - If the intent is `MULTI_STEP`, execute all sub-intents sequentially via `PlanExecutor`, collecting results from each step
    - Go to **Result Evaluation**
-3. If intent confidence is between 0.3 and 0.7, or if the intent is complex:
+3. If intent confidence is between 0.2 and 0.5, or if the intent is complex:
    - Go to **LLM-Assisted Execution**
-4. If intent confidence < 0.3:
+4. If intent confidence < 0.2:
    - If LLM available: go to **LLM-Assisted Execution**
    - If LLM not available: respond with "I'm not sure what you want me to do. Could you rephrase?"
 
 **LLM-Assisted Execution (multi-turn loop):**
-1. Build a system prompt using `SystemPromptBuilder` (Step 8.2)
+1. Build a system prompt using `SystemPromptBuilder` (Step 10.2)
 2. Build the conversation messages array: system prompt + last 10 conversation history entries + current user message
-3. Send to the LLM via `llm_router` with `stream=False` (for reliability with smaller models)
-4. Parse the LLM response:
-   - Check if the response contains a tool-call instruction. Detect this by looking for patterns like:
+3. Send to the LLM via the `LLMRouter` instance (from `src/proxima/intelligence/llm_router.py`; its `route()` method handles provider selection, consent, and API key management). Use `stream=False` for reliability with smaller models.
+4. Parse the LLM response for tool calls. **Use this priority order** (most reliable first):
+   - **Priority 1 — Structured function calling**: If the `LLMProvider` supports function calling (OpenAI, Anthropic, Google), use the structured `ToolCall` parsing already in `LLMToolIntegration.parse_tool_calls()` from `llm_integration.py`. This is the most reliable method.
+   - **Priority 2 — JSON tool-call blocks**: If the model returns a JSON code block like `{"tool": "...", "arguments": {...}}`, parse it directly.
+   - **Priority 3 — Text pattern fallback** (for models like Ollama `llama2-uncensored` that may not support function calling): Detect patterns like:
      - "I'll run: `{command}`" → extract command, execute via `RunCommandTool`
      - "Let me execute: `{command}`" → same
      - "Running `{command}`..." → same
-     - If the LLM provider supports function calling format (OpenAI, Anthropic), use the structured `ToolCall` parsing from `llm_integration.py`
    - If a tool call is detected:
      - Execute the tool
      - Feed the result back to the LLM as a new message: "Tool result: {result}"
@@ -1607,11 +1609,12 @@ The total prompt must stay under 2,000 tokens to leave room for conversation his
 Replace the current 5-phase `_generate_response()` method in `agent_ai_assistant.py` with a call to the `AgentLoop`:
 
 1. In the `_initialize_components()` method (or equivalent initialization), instantiate the `AgentLoop`:
-   ```
+   ```python
    self._agent_loop = AgentLoop(
        nl_processor=self._robust_nl_processor,
        tool_bridge=self._intent_tool_bridge,
-       llm_router=self._llm_router,
+       llm_router=self._llm_router,              # LLMRouter from intelligence/llm_router.py
+       llm_tool_integration=self._llm_tool_integration,  # LLMToolIntegration or None
        session_context=self._session_context,
        ui_callback=self._show_ai_message
    )
@@ -1637,7 +1640,7 @@ This refactoring eliminates the need for the current Phase 0 (`_try_direct_backe
 If the integrated LLM supports streaming (Ollama and most API providers do), enable token-by-token display:
 
 1. In `AgentLoop`, when the LLM is called in the multi-turn loop:
-   - If the LLM router supports streaming (check `llm_router.supports_streaming()`), use the streaming API
+   - Check if the LLM provider supports streaming by calling `hasattr(provider, 'stream_send')` — the `LLMRouter` in `llm_router.py` already defines `stream_send()` on providers that support it (Ollama, OpenAI, Anthropic, Google). Use `stream_send()` when available.
    - Create an async generator that yields tokens
    - Pass tokens to the UI callback incrementally
 
@@ -1679,53 +1682,56 @@ For conversations that run long (many tool executions accumulating results), man
 ### Objective
 Ensure every operation has proper error handling, meaningful error messages, recovery suggestions, and appropriate safety mechanisms for all five functionality domains.
 
-### Step 11.1: Create an Error Classification System
+### Step 11.1: Create an Agent Error Handler
 
-Add a new file `src/proxima/agent/error_handler.py`. This module classifies errors and provides recovery strategies.
+Add a new file `src/proxima/agent/agent_error_handler.py`. This module provides agent-specific error classification and recovery strategies.
 
-**The `ErrorClassifier` class defines error categories:**
+> **Important:** An `ErrorClassifier` class already exists in `src/proxima/agent/dynamic_tools/error_detection.py` with its own `classify(error: Exception, context: Optional[ErrorContext])` method and the `ErrorCategory` enum. The new `AgentErrorHandler` class below **wraps** the existing `ErrorClassifier` for classifying raw terminal output (strings + exit codes) and adds recovery strategy logic. Import and reuse `ErrorCategory` from `error_detection.py` — do NOT redefine it.
 
-- `PERMISSION_DENIED`: File access denied, admin needed, git auth failure
+**The `AgentErrorHandler` class maps terminal output to existing `ErrorCategory` values with recovery strategies:**
+
+- `ErrorCategory.PERMISSION`: File access denied, admin needed, git auth failure
   - Recovery: suggest running with admin privileges or fixing permissions
-- `NOT_FOUND`: File, directory, package, branch, command not found
+- `ErrorCategory.FILESYSTEM`: File, directory, package, branch, command not found
   - Recovery: list similar files/directories, suggest correct spelling
-- `NETWORK_ERROR`: DNS failure, timeout, connection refused, SSL error
+- `ErrorCategory.NETWORK`: DNS failure, timeout, connection refused, SSL error
   - Recovery: check internet, retry with longer timeout
-- `DEPENDENCY_ERROR`: Module not found, version conflict, missing system library
+- `ErrorCategory.DEPENDENCY`: Module not found, version conflict, missing system library
   - Recovery: auto-detect and suggest install command (delegates to `DependencyManager`)
-- `BUILD_FAILURE`: Compilation error, cmake error, make error
+- `ErrorCategory.BUILD`: Compilation error, cmake error, make error
   - Recovery: suggest installing build tools, check logs for specific error
-- `SYNTAX_ERROR`: Invalid code produced by modification
+- `ErrorCategory.SYNTAX`: Invalid code produced by modification
   - Recovery: undo the modification via CheckpointManager, show the syntax error
-- `TIMEOUT`: Command exceeded time limit
+- `ErrorCategory.TIMEOUT`: Command exceeded time limit
   - Recovery: retry with longer timeout or run in background
-- `RESOURCE_ERROR`: Disk full, out of memory, GPU not available
+- `ErrorCategory.RESOURCE` / `ErrorCategory.MEMORY` / `ErrorCategory.DISK`: Disk full, out of memory, GPU not available
   - Recovery: suggest freeing resources, point to resource monitor
-- `GIT_ERROR`: Merge conflict, detached HEAD, dirty working tree
+- `ErrorCategory.GIT`: Merge conflict, detached HEAD, dirty working tree
   - Recovery: specific git commands to resolve the situation
-- `USER_CANCELLED`: User denied consent
-  - Recovery: none needed, inform that operation was cancelled
+- (User cancellation): No `ErrorCategory` equivalent — handle separately as a control flow event, not an error
 
-**Method `classify(error_output: str, exit_code: int) -> Tuple[ErrorCategory, str, Optional[str]]`:**
+**Method `classify_output(error_output: str, exit_code: int) -> Tuple[ErrorCategory, str, Optional[str]]`:**
 Returns: (category, human_readable_message, suggested_fix_command)
 
+Note: This method is named `classify_output` (not `classify`) to avoid confusion with the existing `ErrorClassifier.classify()` which takes an `Exception` object.
+
 Uses regex pattern matching on the error output:
-- `"Permission denied"` or `"Access is denied"` → `PERMISSION_DENIED`
-- `"No such file"` or `"not found"` or `"not recognized"` → `NOT_FOUND`
-- `"Could not resolve host"` or `"Connection refused"` or `"timed out"` → `NETWORK_ERROR`
-- `"ModuleNotFoundError"` or `"No module named"` → `DEPENDENCY_ERROR`
-- `"error: "` combined with `"cmake"` or `"make"` or `"build"` → `BUILD_FAILURE`
-- `"SyntaxError"` or `"IndentationError"` → `SYNTAX_ERROR`
-- `"Timed out"` or exit code 124 → `TIMEOUT`
-- `"No space left"` or `"MemoryError"` → `RESOURCE_ERROR`
-- `"CONFLICT"` or `"fatal: "` in git context → `GIT_ERROR`
+- `"Permission denied"` or `"Access is denied"` → `ErrorCategory.PERMISSION`
+- `"No such file"` or `"not found"` or `"not recognized"` → `ErrorCategory.FILESYSTEM`
+- `"Could not resolve host"` or `"Connection refused"` or `"timed out"` → `ErrorCategory.NETWORK`
+- `"ModuleNotFoundError"` or `"No module named"` → `ErrorCategory.DEPENDENCY`
+- `"error: "` combined with `"cmake"` or `"make"` or `"build"` → `ErrorCategory.BUILD`
+- `"SyntaxError"` or `"IndentationError"` → `ErrorCategory.SYNTAX`
+- `"Timed out"` or exit code 124 → `ErrorCategory.TIMEOUT`
+- `"No space left"` or `"MemoryError"` → `ErrorCategory.RESOURCE`
+- `"CONFLICT"` or `"fatal: "` in git context → `ErrorCategory.GIT`
 
 ### Step 11.2: Wrap Tool Execution with Error Handling
 
 In `IntentToolBridge.dispatch()`, wrap every tool execution in a try-except block that:
 
 1. Catches all exceptions (`Exception` and subclasses)
-2. Calls `ErrorClassifier.classify(str(e), getattr(e, 'returncode', 1))` to categorize
+2. Calls `AgentErrorHandler.classify_output(str(e), getattr(e, 'returncode', 1))` to categorize
 3. Formats a user-friendly message:
    ```
    "❌ {operation} failed: {human_readable_message}
@@ -1764,7 +1770,7 @@ In `IntentToolBridge.dispatch()`, after a failed execution:
 
 In `AgentLoop.process_message()`:
 
-1. After each tool execution that fails, pass the error through `ErrorClassifier`
+1. After each tool execution that fails, pass the error through `AgentErrorHandler`
 2. If the classification suggests a fix:
    - If an LLM is available, include the error and fix suggestion in the next LLM prompt: "The {operation} failed with error: {error}. Suggested fix: {fix}. Should I apply the fix?"
    - The LLM can then decide: apply the fix and retry, try an alternative approach, or report failure
@@ -2017,7 +2023,7 @@ Create `tests/test_e2e_agent.py` with integration tests that exercise the full p
 
 **Test 3 — Multi-step plan:** Send "clone the repo, install dependencies, build it". Verify that a plan with 3 steps is created, presented, and (after mock confirmation) executed in order.
 
-**Test 4 — Error recovery:** Send a command that fails with a dependency error. Verify that `ErrorClassifier` correctly identifies the error, `DependencyManager` suggests a fix, and the fix is presented to the user.
+**Test 4 — Error recovery:** Send a command that fails with a dependency error. Verify that `AgentErrorHandler` correctly identifies the error, `DependencyManager` suggests a fix, and the fix is presented to the user.
 
 **Test 5 — Context resolution:** Send "clone https://github.com/kunal5556/LRET", then send "build it". Verify that "it" resolves to the cloned repository path.
 
@@ -2047,7 +2053,7 @@ In `agent_ai_assistant.py`, update the initialization sequence to instantiate al
 3. `TerminalOrchestrator` — new, wraps existing `MultiTerminalMonitor`, store as `self._terminal_orchestrator`
 4. `IntentToolBridge` — new, takes `ToolRegistry`, `DependencyManager`, `TerminalOrchestrator`, `CheckpointManager`, `AdminPrivilegeHandler`; store as `self._intent_tool_bridge`
 5. `SystemPromptBuilder` — new, store as `self._system_prompt_builder`
-6. `ErrorClassifier` — new, store as `self._error_classifier`
+6. `AgentErrorHandler` — new (wraps existing `ErrorClassifier` from `error_detection.py`), store as `self._error_handler`
 7. `AgentLoop` — new, takes all of the above; store as `self._agent_loop`
 
 Pass the consent callback to `IntentToolBridge` during initialization. The callback is a method on the agent assistant screen that displays consent dialogs.
@@ -2063,7 +2069,7 @@ robust_nl_processor.py (standalone, no imports from above)
 intent_tool_bridge.py ← robust_nl_processor.py, tool_registry.py, tools/*.py
 dependency_manager.py (standalone, uses subprocess only)
 terminal_orchestrator.py ← multi_terminal.py, terminal_state_machine.py
-error_handler.py (standalone)
+agent_error_handler.py ← error_detection.py (uses existing ErrorCategory and ErrorClassifier)
 system_prompt_builder.py ← tool_registry.py, execution_context.py
 agent_loop.py ← all of the above
 agent_ai_assistant.py ← agent_loop.py (single entry point)
@@ -2178,7 +2184,9 @@ class TodoItem:
     active_form: str                         # Present continuous form (e.g., "Running tests")
 ```
 
-**The `SessionManager` class contains:**
+**The `AgentSessionManager` class contains:**
+
+> **Note:** Named `AgentSessionManager` (not `SessionManager`) to avoid collision with the existing `SessionManager` in `multi_terminal.py` (L888) which manages terminal sessions.
 
 **Constructor `__init__(self, storage_dir: str = ".proxima/sessions")`:**
 - `storage_dir`: directory for session JSON files (relative to workspace root)
@@ -2250,9 +2258,9 @@ Return `_sessions.get(_current_session_id)` or `None`.
 
 ### Step 15.2: Implement Auto-Summarization
 
-Add summarization capability to the `SessionManager` that triggers automatically when the context window approaches its limit. This follows the Crush pattern of replacing old messages with a summary message while preserving critical state.
+Add summarization capability to the `AgentSessionManager` that triggers automatically when the context window approaches its limit. This follows the Crush pattern of replacing old messages with a summary message while preserving critical state.
 
-**Add to `SessionManager`:**
+**Add to `AgentSessionManager`:**
 
 **Constants:**
 ```python
@@ -2333,9 +2341,9 @@ Instruct the resuming assistant to use the todos tool to continue tracking progr
 
 ### Step 15.3: Integrate Session Manager into the Agent Loop
 
-Modify `agent_loop.py` (from Phase 10) to use the `SessionManager`:
+Modify `agent_loop.py` (from Phase 10) to use the `AgentSessionManager`:
 
-1. **In `AgentLoop.__init__`**, accept an additional parameter `session_manager: SessionManager`
+1. **In `AgentLoop.__init__`**, accept an additional parameter `session_manager: AgentSessionManager`
 
 2. **At the start of `process_message()`:**
    - If no current session exists, create one: `self.session_manager.create_session()`
@@ -2368,40 +2376,40 @@ In `agent_ai_assistant.py`, add session management commands that are accessible 
 **New Session:** User types `/new` or presses `Ctrl+N`:
 1. Save the current session
 2. Clear the chat history display
-3. Create a new session via `SessionManager.create_session()`
+3. Create a new session via `AgentSessionManager.create_session()`
 4. Reset the `SessionContext`
 5. Display "New session started"
 
 **Switch Session:** User types `/sessions` or presses `Ctrl+S`:
-1. Call `SessionManager.list_sessions()` to get available sessions
+1. Call `AgentSessionManager.list_sessions()` to get available sessions
 2. Display a selection dialog (similar to Textual's `OptionList` widget) showing:
    - Session title
    - Last activity time (humanized, e.g., "2 hours ago")
    - Message count
-3. On selection, call `SessionManager.switch_session(session_id)`
+3. On selection, call `AgentSessionManager.switch_session(session_id)`
 4. Load and display the session's message history in the chat
 5. Restore the `SessionContext`
 
 **Import Session:** User types `/import <path>`:
-1. Call `SessionManager.import_session(path)`
+1. Call `AgentSessionManager.import_session(path)`
 2. Load and display the imported conversation
 3. Display "Imported session: {title} ({message_count} messages)"
 
 **Summarize Session:** User types `/summarize`:
-1. Call `SessionManager.summarize_session()` explicitly
+1. Call `AgentSessionManager.summarize_session()` explicitly
 2. Display the generated summary in the chat
 3. Show "Session summarized — older messages compressed"
 
 **Delete Session:** User types `/delete`:
 1. Show confirmation dialog: "Delete current session? This cannot be undone."
-2. On confirm: `SessionManager.delete_session(current_session_id)`
+2. On confirm: `AgentSessionManager.delete_session(current_session_id)`
 3. Create a new empty session
 
 ### Step 15.5: Session Title Auto-Generation
 
 When a new session receives its first user message:
 
-1. In `SessionManager.add_message()`, check if this is the first user message (message_count was 0)
+1. In `AgentSessionManager.add_message()`, check if this is the first user message (message_count was 0)
 2. If so, asynchronously generate a title:
    - Prefer the small model (if dual-model is configured) for cost efficiency
    - Prompt: "Generate a concise title (max 8 words) for this conversation: {first_message}"
@@ -2493,18 +2501,38 @@ The main agent can spawn sub-agents when:
 Create a new file `src/proxima/agent/dynamic_tools/tools/web_tools.py`. This module provides web search and content fetching capabilities.
 
 **The `WebFetchTool` class (registered as `web_fetch`):**
-```python
-class WebFetchTool(ToolInterface):
-    name = "web_fetch"
-    description = "Fetch content from a URL and return the text"
-    category = ToolCategory.SYSTEM
-    permission_level = PermissionLevel.ELEVATED  # Requires user consent
-    risk_level = RiskLevel.LOW
 
-    parameters = [
-        ToolParameter(name="url", type="string", description="The URL to fetch", required=True),
-        ToolParameter(name="timeout", type="integer", description="Timeout in seconds (max 60)", required=False, default=30),
-    ]
+> **Note:** All new tools must inherit from `BaseTool` (not `ToolInterface` directly) and use `@property` methods for metadata, matching the convention used by all existing tools (`ReadFileTool`, `GitStatusTool`, etc.).
+
+```python
+@register_tool
+class WebFetchTool(BaseTool):
+    @property
+    def name(self) -> str:
+        return "web_fetch"
+
+    @property
+    def description(self) -> str:
+        return "Fetch content from a URL and return the text"
+
+    @property
+    def category(self) -> ToolCategory:
+        return ToolCategory.SYSTEM
+
+    @property
+    def required_permission(self) -> PermissionLevel:
+        return PermissionLevel.NETWORK  # Requires user consent — network access
+
+    @property
+    def risk_level(self) -> RiskLevel:
+        return RiskLevel.LOW
+
+    @property
+    def parameters(self) -> List[ToolParameter]:
+        return [
+            ToolParameter(name="url", param_type=ParameterType.URL, description="The URL to fetch", required=True),
+            ToolParameter(name="timeout", param_type=ParameterType.INTEGER, description="Timeout in seconds (max 60)", required=False, default=30),
+        ]
 ```
 
 **Implementation of `execute()`:**
@@ -2528,17 +2556,34 @@ class WebFetchTool(ToolInterface):
 This tool spawns a sub-agent to analyze web content, similar to Crush's `agentic_fetch`:
 
 ```python
-class AgenticFetchTool(ToolInterface):
-    name = "agentic_fetch"
-    description = "Search the web and/or fetch a URL, then analyze the content with an AI sub-agent"
-    category = ToolCategory.SYSTEM
-    permission_level = PermissionLevel.ELEVATED
-    risk_level = RiskLevel.LOW
+@register_tool
+class AgenticFetchTool(BaseTool):
+    @property
+    def name(self) -> str:
+        return "agentic_fetch"
 
-    parameters = [
-        ToolParameter(name="url", type="string", description="URL to fetch (optional — if omitted, searches the web)", required=False),
-        ToolParameter(name="prompt", type="string", description="What information to find or extract", required=True),
-    ]
+    @property
+    def description(self) -> str:
+        return "Search the web and/or fetch a URL, then analyze the content with an AI sub-agent"
+
+    @property
+    def category(self) -> ToolCategory:
+        return ToolCategory.SYSTEM
+
+    @property
+    def required_permission(self) -> PermissionLevel:
+        return PermissionLevel.NETWORK  # Network access required
+
+    @property
+    def risk_level(self) -> RiskLevel:
+        return RiskLevel.LOW
+
+    @property
+    def parameters(self) -> List[ToolParameter]:
+        return [
+            ToolParameter(name="url", param_type=ParameterType.URL, description="URL to fetch (optional — if omitted, searches the web)", required=False),
+            ToolParameter(name="prompt", param_type=ParameterType.STRING, description="What information to find or extract", required=True),
+        ]
 ```
 
 **Implementation of `execute()`:**
@@ -2650,31 +2695,44 @@ Create a new file `src/proxima/agent/dynamic_tools/tools/todos_tool.py`. This pr
 **The `TodosTool` class (registered via `@register_tool`):**
 ```python
 @register_tool
-class TodosTool(ToolInterface):
-    name = "todos"
-    description = """Creates and manages a structured task list for tracking progress on complex, multi-step coding tasks.
+class TodosTool(BaseTool):
+    @property
+    def name(self) -> str:
+        return "todos"
+
+    @property
+    def description(self) -> str:
+        return """Creates and manages a structured task list for tracking progress on complex, multi-step coding tasks.
     Use this tool proactively for:
     - Complex multi-step tasks requiring 3+ distinct steps
     - After receiving new instructions to capture requirements
     - When starting work on a task (mark as in_progress BEFORE beginning)
     - After completing a task (mark completed immediately)
     Do NOT use for single, trivial tasks."""
-    category = ToolCategory.SYSTEM
-    permission_level = PermissionLevel.NONE  # No consent needed — it's just tracking
-    risk_level = RiskLevel.NONE
 
-    parameters = [
-        ToolParameter(name="todos", type="array", description="The complete updated todo list", required=True,
-                      items_schema={
-                          "type": "object",
-                          "properties": {
-                              "content": {"type": "string", "description": "What needs to be done (imperative form)"},
-                              "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
-                              "active_form": {"type": "string", "description": "Present continuous form (e.g., 'Running tests')"},
-                          },
-                          "required": ["content", "status", "active_form"]
-                      }),
-    ]
+    @property
+    def category(self) -> ToolCategory:
+        return ToolCategory.SYSTEM
+
+    @property
+    def required_permission(self) -> PermissionLevel:
+        return PermissionLevel.READ_ONLY  # No consent needed — it's just tracking
+
+    @property
+    def risk_level(self) -> RiskLevel:
+        return RiskLevel.NONE
+
+    @property
+    def parameters(self) -> List[ToolParameter]:
+        return [
+            ToolParameter(
+                name="todos",
+                param_type=ParameterType.ARRAY,
+                description="The complete updated todo list. Each item is a JSON object with 'content' (imperative string), 'status' ('pending'|'in_progress'|'completed'), and 'active_form' (present continuous string).",
+                required=True,
+                inference_hint="Array of {content, status, active_form} objects. At most one item may be in_progress at a time."
+            ),
+        ]
 ```
 
 **Implementation of `execute()`:**
@@ -2755,27 +2813,44 @@ class ModelRole(Enum):
 ```
 
 **Add a `DualModelRouter` class:**
+
+> **Note:** `LLMRouter.__init__` takes `(settings: Settings | None, consent_prompt: Callable | None)`. The `DualModelRouter` creates two routers by cloning the base `Settings` and overriding the provider/model fields for each role.
+
 ```python
 class DualModelRouter:
-    def __init__(self, large_model_config: Dict, small_model_config: Optional[Dict] = None):
-        self._large = LLMRouter(large_model_config)
-        self._small = LLMRouter(small_model_config) if small_model_config else self._large
+    def __init__(self, settings: Settings, consent_prompt: Callable[[str], bool] | None = None):
+        self._consent_prompt = consent_prompt
+        # Large model router uses the base settings (settings.llm.provider + settings.llm.model)
+        self._large = LLMRouter(settings=settings, consent_prompt=consent_prompt)
+        # Small model router — if agent.models.small is configured in settings,
+        # create a Settings copy with overridden llm.provider/llm.model; else reuse large
+        small_cfg = getattr(settings, 'agent_small_model', None)
+        if small_cfg:
+            small_settings = settings.model_copy(deep=True)
+            small_settings.llm.provider = small_cfg.get('provider', settings.llm.provider)
+            small_settings.llm.model = small_cfg.get('model', settings.llm.model)
+            self._small = LLMRouter(settings=small_settings, consent_prompt=consent_prompt)
+        else:
+            self._small = self._large
 
     def get_router(self, role: ModelRole = ModelRole.LARGE) -> LLMRouter:
         if role == ModelRole.SMALL:
             return self._small
         return self._large
 
-    def set_models(self, large: Dict, small: Optional[Dict] = None):
-        self._large = LLMRouter(large)
-        self._small = LLMRouter(small) if small else self._large
+    def set_models(self, settings: Settings, small_settings: Settings | None = None):
+        self._large = LLMRouter(settings=settings, consent_prompt=self._consent_prompt)
+        if small_settings:
+            self._small = LLMRouter(settings=small_settings, consent_prompt=self._consent_prompt)
+        else:
+            self._small = self._large
 ```
 
 **Usage pattern:**
 - `AgentLoop` uses `ModelRole.LARGE` for the main reasoning loop
 - `SubAgent` uses `ModelRole.SMALL` for search and context tasks
-- `SessionManager.summarize_session()` uses `ModelRole.LARGE` (summaries need accuracy)
-- `SessionManager._generate_title()` uses `ModelRole.SMALL` (titles are simple)
+- `AgentSessionManager.summarize_session()` uses `ModelRole.LARGE` (summaries need accuracy)
+- `AgentSessionManager._generate_title()` uses `ModelRole.SMALL` (titles are simple)
 - `AgenticFetchTool` uses `ModelRole.SMALL` for web content analysis
 
 **Configuration in `configs/default.yaml`:**
@@ -2859,7 +2934,7 @@ Update `agent_loop.py` to incorporate all Phase 16 capabilities:
 | `src/proxima/agent/dynamic_tools/tools/filesystem_tools.py` | 4 | No changes to tool implementations (already complete) |
 | `src/proxima/agent/dynamic_tools/tools/git_tools.py` | 8 | No changes to tool implementations (already complete) |
 | `src/proxima/agent/dynamic_tools/tools/terminal_tools.py` | 4 | No changes to tool implementations (already complete) |
-| `src/proxima/agent/dynamic_tools/agent_loop.py` | 10, 15, 16 | Accept SessionManager, SubAgent factory, ToolPermissionManager, DualModelRouter; add auto-summarization checks, permission checks, sub-agent spawning, todos integration |
+| `src/proxima/agent/dynamic_tools/agent_loop.py` | 10, 15, 16 | Accept AgentSessionManager, SubAgent factory, ToolPermissionManager, DualModelRouter; add auto-summarization checks, permission checks, sub-agent spawning, todos integration |
 | `src/proxima/agent/dynamic_tools/llm_integration.py` | 16 | Add ModelRole enum, DualModelRouter class for large/small model selection |
 | `src/proxima/agent/backend_builder.py` | 6 | Called by IntentToolBridge for BACKEND_BUILD; uses BuildProfileLoader to load YAML profiles and execute build steps |
 | `src/proxima/agent/backend_modifier.py` | 6 | Called by IntentToolBridge for BACKEND_MODIFY; generates CodeChange objects, applies modifications with diff preview |
@@ -2879,7 +2954,7 @@ Update `agent_loop.py` to incorporate all Phase 16 capabilities:
 | `os`, `shutil`, `pathlib` (stdlib) | File system operations, path resolution |
 | `re` (stdlib) | Pattern matching for intent recognition, entity extraction, error classification |
 | `json` (stdlib) | Configuration parsing, result serialization |
-| `tomllib` (stdlib, Python 3.11+) | pyproject.toml parsing for dependency detection |
+| `tomllib` (stdlib since Python 3.11) | pyproject.toml parsing for dependency detection |
 | `threading` (stdlib) | Background terminal output reading threads |
 | `uuid` (stdlib) | Terminal ID generation |
 | `logging` (stdlib) | Error logging to file |
@@ -2938,7 +3013,7 @@ Phase 16 (Crush-Inspired Capabilities)      ← Core functionality 11 — sub-ag
 - Phase 11 (Error Handling) can be incrementally developed alongside Phases 4-10
 - Phase 9 (Multi-Terminal) can start after Phase 4 since it depends on terminal execution infrastructure
 - Phase 15 (Session Context) can start after Phase 10 (requires AgentLoop) and Phase 2 (requires SessionContext)
-- Phase 16 (Crush-Inspired) can start after Phase 15's SessionManager is ready (sub-agents need session creation); the TodosTool and PermissionManager steps can begin in parallel with Phase 15
+- Phase 16 (Crush-Inspired) can start after Phase 15's AgentSessionManager is ready (sub-agents need session creation); the TodosTool and PermissionManager steps can begin in parallel with Phase 15
 
 **Sequential requirements:**
 - Phase 1 must complete before Phase 2 (enum must be stable)
@@ -2947,7 +3022,7 @@ Phase 16 (Crush-Inspired Capabilities)      ← Core functionality 11 — sub-ag
 - Phase 6 should follow Phase 5 (backend builds use dependency management)
 - Phase 10 must come after Phases 3-9 (integrates all components)
 - Phase 14 must complete before Phase 15 (final wiring must be stable before session persistence layer)
-- Phase 15 must substantially complete before Phase 16 (SessionManager needed for sub-agent TaskSessions, dual-model routing)
+- Phase 15 must substantially complete before Phase 16 (AgentSessionManager needed for sub-agent TaskSessions, dual-model routing)
 - Phase 16 is the final phase — strict compliance validation (functionality 12) should be verified across all 16 phases at the end
 
 ---
