@@ -54,6 +54,7 @@ The assistant's architecture remains stable. The integrated model operates dynam
 - `src/proxima/agent/modification_preview.py` (653 lines): Diff visualization system. Contains `ModificationScope`, `DiffLineType`, `DiffLine`, `DiffHunk` dataclasses. Supports side-by-side diff display with syntax highlighting.
 - `src/proxima/agent/backend_builder.py` (1,147 lines): Backend build pipeline. Contains `BuildProfileLoader` (loads from `configs/backend_build_profiles.yaml`), `BackendBuilder` class with async build method, GPU detection integration, `BuildArtifactManager`, progress callbacks, and validation.
 - `src/proxima/agent/multi_terminal.py` (1,626 lines): Multi-terminal session management. Contains `TerminalState` enum (PENDING, STARTING, RUNNING, COMPLETED, FAILED, TIMEOUT, CANCELLED), `TerminalEventType`, `TerminalEvent`, circular output buffer (10,000 lines), `SessionManager` for 10 concurrent sessions, cross-platform command normalization, event-based state notifications.
+- `src/proxima/agent/dynamic_tools/deployment_monitoring.py` (3,000 lines): Deployment and dependency monitoring. Contains `DependencyManager` class (line 1004) focused on vulnerability scanning, license compliance checking, dependency pinning, and update strategy management. Note: this is a different concern from the `ProjectDependencyManager` created in Phase 5 — the existing `DependencyManager` handles security/compliance auditing, while `ProjectDependencyManager` handles project dependency detection, installation, and error-driven auto-fix.
 
 **TUI Layer:**
 - `src/proxima/tui/screens/agent_ai_assistant.py` (7,747 lines): Main AI assistant screen. Contains 5-phase response pipeline in `_generate_response()`: Phase 0 (`_try_direct_backend_operation`) for pattern-matched backend/clone/build requests; Phase 1 (`_try_robust_nl_execution`) using `RobustNLProcessor`; Phase 2 (`_analyze_and_execute_with_llm`) for LLM-based intent extraction; Phase 3 (`_try_execute_agent_command`) for keyword-based agent commands; Phase 4 (`_generate_llm_response`) for general chat. Contains ~130 methods covering all operations.
@@ -765,7 +766,9 @@ Enable the agent to install required dependencies, configure environments, handl
 
 Add a new file `src/proxima/agent/dependency_manager.py`. This module provides dependency detection and installation capabilities.
 
-The `DependencyManager` class must contain:
+> **Important:** A class named `DependencyManager` already exists in `src/proxima/agent/dynamic_tools/deployment_monitoring.py` (line 1004). That class handles vulnerability scanning, license compliance, and dependency pinning — a different concern. The new class below is named `ProjectDependencyManager` to avoid collision. It focuses on project dependency detection (scanning `requirements.txt`, `setup.py`, etc.), installation, and build error auto-fix.
+
+The `ProjectDependencyManager` class must contain:
 
 **A method `detect_project_dependencies(project_path: str) -> Dict[str, Any]`** that scans a directory for dependency specification files and returns a structured description:
 1. Check for `requirements.txt` → parse it line by line, extracting package names and version constraints
@@ -809,9 +812,9 @@ In `IntentToolBridge`, add handling for the three dependency-related intents:
 **For `INSTALL_DEPENDENCY`:**
 1. Extract `package` entities from the intent
 2. If specific packages are named, build `pip install package1 package2 ...` command
-3. If no packages named but a path context exists (e.g., user said "install dependencies" after cloning), call `DependencyManager.detect_project_dependencies(context_path)` and build the install command from detected dependencies
+3. If no packages named but a path context exists (e.g., user said "install dependencies" after cloning), call `ProjectDependencyManager.detect_project_dependencies(context_path)` and build the install command from detected dependencies
 4. Execute via `RunCommandTool`
-5. After execution, parse the output. If errors found, call `DependencyManager.detect_and_fix_errors()` and present the fix suggestion to the user. If the user approves, auto-execute the fix.
+5. After execution, parse the output. If errors found, call `ProjectDependencyManager.detect_and_fix_errors()` and present the fix suggestion to the user. If the user approves, auto-execute the fix.
 
 **For `CONFIGURE_ENVIRONMENT`:**
 1. Determine what the user wants: create venv, activate venv, set env vars
@@ -823,7 +826,7 @@ In `IntentToolBridge`, add handling for the three dependency-related intents:
 
 **For `CHECK_DEPENDENCY`:**
 1. Extract `package` entities
-2. For each package, call `DependencyManager.check_installed(package)`
+2. For each package, call `ProjectDependencyManager.check_installed(package)`
 3. Format results as a table showing package name, installed status, and version
 4. Display in chat
 
@@ -831,7 +834,7 @@ In `IntentToolBridge`, add handling for the three dependency-related intents:
 
 In `IntentToolBridge.dispatch()`, after executing any `RUN_COMMAND` or `RUN_SCRIPT` that fails (ToolResult.success is False):
 
-1. Pass the error output to `DependencyManager.detect_and_fix_errors(error_output, working_dir)`
+1. Pass the error output to `ProjectDependencyManager.detect_and_fix_errors(error_output, working_dir)`
 2. If a fix is found:
    - Display to the user: "❌ Execution failed. Detected issue: [description]. Suggested fix: [fix_command]. Shall I apply it?"
    - If user approves, execute the fix command
@@ -848,7 +851,7 @@ For backend build operations (detected by keywords like "build", "compile" combi
 
 1. When the user requests building a backend, the bridge should load the backend's profile from the YAML using `BuildProfileLoader` from `backend_builder.py`
 2. The profile's `dependencies.packages` list specifies required Python packages
-3. Before building, check each required package via `DependencyManager.check_installed()`
+3. Before building, check each required package via `ProjectDependencyManager.check_installed()`
 4. If any packages are missing, present the list to the user and offer to install them
 5. If the user approves, install all missing packages via `pip install`
 6. Then proceed with the build steps from the profile
@@ -872,7 +875,8 @@ The following backends must be buildable and modifiable through the agent:
 6. **QuEST** — profile: `quest`
 7. **qsim** — profile: `qsim`
 8. **cuQuantum** — profile: `cuquantum`
-9. **Any additional backends** — the system must support generic build workflows for backends not in the YAML profiles
+9. **qsim CUDA** — profile: `qsim_cuda`
+10. **Any additional backends** — the system must support generic build workflows for backends not in the YAML profiles
 
 ### Step 6.1: Backend Build via YAML Profiles and Terminal
 
@@ -880,13 +884,13 @@ When the user requests building a backend (intent `BACKEND_BUILD`), the `IntentT
 
 **Step 1 — Backend Identification:**
 1. Extract the backend name from the intent entities. The entity extractor (Phase 2) should recognize backend names from the user's message: "build lret cirq", "compile the qiskit backend", "build cirq-scalability-comparison", etc.
-2. Normalize the extracted name to match a profile key in `configs/backend_build_profiles.yaml`. Build a normalization mapping as a constant in `IntentToolBridge`: `{"lret cirq": "lret_cirq_scalability", "lret pennylane": "lret_pennylane_hybrid", "lret phase 7": "lret_phase_7_unified", "cirq": "cirq", "qiskit": "qiskit", "qiskit aer": "qiskit", "quest": "quest", "qsim": "qsim", "cuquantum": "cuquantum", "cuquantum sim": "cuquantum"}`.
+2. Normalize the extracted name to match a profile key in `configs/backend_build_profiles.yaml`. Build a normalization mapping as a constant in `IntentToolBridge`: `{"lret cirq": "lret_cirq_scalability", "lret pennylane": "lret_pennylane_hybrid", "lret phase 7": "lret_phase_7_unified", "cirq": "cirq", "qiskit": "qiskit", "qiskit aer": "qiskit", "quest": "quest", "qsim": "qsim", "qsim cuda": "qsim_cuda", "cuquantum": "cuquantum", "cuquantum sim": "cuquantum"}`.
 3. If the backend matches a known profile, load the profile using `BuildProfileLoader` from `src/proxima/agent/backend_builder.py`.
 4. If no profile matches, treat as a generic backend: look for `setup.py`, `pyproject.toml`, or `Makefile` in the backend directory and construct a default build sequence.
 
 **Step 2 — Dependency Pre-Check:**
 1. Load the profile's `dependencies.packages` list
-2. For each package, call `DependencyManager.check_installed(package)` (from Phase 5)
+2. For each package, call `ProjectDependencyManager.check_installed(package)` (from Phase 5)
 3. If any packages are missing, present the missing list to the user:
    ```
    "⚠️ Missing dependencies for {backend_name}:
@@ -1123,7 +1127,8 @@ For `BACKEND_LIST`, the handler simply reads `configs/backend_build_profiles.yam
 | 5 | qiskit | IBM Qiskit Aer Backend | No |
 | 6 | quest | QuEST Backend | No |
 | 7 | qsim | Google qsim Backend | No |
-| 8 | cuquantum | NVIDIA cuQuantum Backend | Yes |"
+| 8 | cuquantum | NVIDIA cuQuantum Backend | Yes |
+| 9 | qsim_cuda | Google qsim CUDA Backend | Yes |"
 ```
 
 ---
@@ -1333,7 +1338,7 @@ Add these patterns to the entity extraction in `robust_nl_processor.py`:
 
 ### Step 8.5: Register All Git Intents in the Bridge
 
-Ensure that every `IntentType.GIT_*` maps to an appropriate executor in `IntentToolBridge.INTENT_TO_TOOL`. For operations that existing tool classes handle (GitStatusTool, GitCommitTool, etc. from `git_tools.py`), map to those tools. For operations not covered by existing tools (push, pull, clone, merge, rebase), map to `RunCommandTool` with constructed git commands.
+Ensure that every `IntentType.GIT_*` maps to an appropriate executor in `IntentToolBridge.INTENT_TO_TOOL`. For operations that existing tool classes handle (GitStatusTool, GitCommitTool, etc. from `git_tools.py`), map to those tools. For operations not covered by existing tools (push, pull, clone, checkout, merge, rebase), map to `RunCommandTool` with constructed git commands.
 
 ---
 
@@ -1554,7 +1559,7 @@ This is the main entry point, called from `agent_ai_assistant.py` when the user 
 **Result Evaluation:**
 1. After execution (either direct or LLM-assisted), check if the result indicates:
    - Success → display result, update context
-   - Failure with fixable error → call `DependencyManager.detect_and_fix_errors()`, apply fix if user approves, retry
+   - Failure with fixable error → call `ProjectDependencyManager.detect_and_fix_errors()`, apply fix if user approves, retry
    - Failure without fix → display error, suggest alternatives
 2. Update `SessionContext` with the result
 3. If the original request was a multi-step plan, check if there are remaining steps and continue execution
@@ -1697,7 +1702,7 @@ Add a new file `src/proxima/agent/agent_error_handler.py`. This module provides 
 - `ErrorCategory.NETWORK`: DNS failure, timeout, connection refused, SSL error
   - Recovery: check internet, retry with longer timeout
 - `ErrorCategory.DEPENDENCY`: Module not found, version conflict, missing system library
-  - Recovery: auto-detect and suggest install command (delegates to `DependencyManager`)
+  - Recovery: auto-detect and suggest install command (delegates to `ProjectDependencyManager`)
 - `ErrorCategory.BUILD`: Compilation error, cmake error, make error
   - Recovery: suggest installing build tools, check logs for specific error
 - `ErrorCategory.SYNTAX`: Invalid code produced by modification
@@ -1878,7 +1883,7 @@ User types:
    Step 4: Configure Proxima to use the backend (update configs/default.yaml)
    ```
 
-3. For Step 2: `DependencyManager.detect_project_dependencies()` scans the repo for `requirements.txt` / `setup.py` / `pyproject.toml`. Installs any missing packages.
+3. For Step 2: `ProjectDependencyManager.detect_project_dependencies()` scans the repo for `requirements.txt` / `setup.py` / `pyproject.toml`. Installs any missing packages.
 
 4. For Step 3: `BackendBuilder` is invoked if the backend matches a known profile name. The bridge checks if `cirq-scalability-comparison` maps to the `lret_cirq_scalability` profile in `backend_build_profiles.yaml`. If yes, follows the profile's build steps. If no profile matches, falls back to generic build: `pip install -e .` followed by `python -m pytest tests/ -v`.
 
@@ -1903,7 +1908,7 @@ User types:
 3. **Execution** — each step uses context from the previous:
    - Step 1: `git clone ... "C:\Users\dell\Pictures\Screenshots\LRET"` → updates `last_cloned_repo`
    - Step 2: `git checkout cirq-scalability-comparison` → uses `last_cloned_repo` as cwd
-   - Step 3: `DependencyManager.detect_project_dependencies()` → auto-detects and installs
+   - Step 3: `ProjectDependencyManager.detect_project_dependencies()` → auto-detects and installs
    - Step 4: Build via `BackendBuilder` or `pip install -e .` + `python setup.py build_ext --inplace`
    - Step 5: `python -m pytest tests/ -v` → runs tests, captures output
    - Step 6: Updates `configs/default.yaml` with the new backend
@@ -2023,7 +2028,7 @@ Create `tests/test_e2e_agent.py` with integration tests that exercise the full p
 
 **Test 3 — Multi-step plan:** Send "clone the repo, install dependencies, build it". Verify that a plan with 3 steps is created, presented, and (after mock confirmation) executed in order.
 
-**Test 4 — Error recovery:** Send a command that fails with a dependency error. Verify that `AgentErrorHandler` correctly identifies the error, `DependencyManager` suggests a fix, and the fix is presented to the user.
+**Test 4 — Error recovery:** Send a command that fails with a dependency error. Verify that `AgentErrorHandler` correctly identifies the error, `ProjectDependencyManager` suggests a fix, and the fix is presented to the user.
 
 **Test 5 — Context resolution:** Send "clone https://github.com/kunal5556/LRET", then send "build it". Verify that "it" resolves to the cloned repository path.
 
@@ -2049,9 +2054,9 @@ Wire everything together, ensure all components communicate correctly, and verif
 In `agent_ai_assistant.py`, update the initialization sequence to instantiate all new components in the correct order:
 
 1. `RobustNLProcessor` — already exists, ensure it has the expanded IntentType enum and keyword mappings from Phase 1
-2. `DependencyManager` — new, instantiate and store as `self._dependency_manager`
+2. `ProjectDependencyManager` — new (distinct from the existing `DependencyManager` in `deployment_monitoring.py`), instantiate and store as `self._dependency_manager`
 3. `TerminalOrchestrator` — new, wraps existing `MultiTerminalMonitor`, store as `self._terminal_orchestrator`
-4. `IntentToolBridge` — new, takes `ToolRegistry`, `DependencyManager`, `TerminalOrchestrator`, `CheckpointManager`, `AdminPrivilegeHandler`; store as `self._intent_tool_bridge`
+4. `IntentToolBridge` — new, takes `ToolRegistry`, `ProjectDependencyManager`, `TerminalOrchestrator`, `CheckpointManager`, `AdminPrivilegeHandler`; store as `self._intent_tool_bridge`
 5. `SystemPromptBuilder` — new, store as `self._system_prompt_builder`
 6. `AgentErrorHandler` — new (wraps existing `ErrorClassifier` from `error_detection.py`), store as `self._error_handler`
 7. `AgentLoop` — new, takes all of the above; store as `self._agent_loop`
@@ -2067,7 +2072,7 @@ tool_interface.py ← tool_registry.py ← tools/*.py
                   ← tool_orchestrator.py ← llm_integration.py
 robust_nl_processor.py (standalone, no imports from above)
 intent_tool_bridge.py ← robust_nl_processor.py, tool_registry.py, tools/*.py
-dependency_manager.py (standalone, uses subprocess only)
+dependency_manager.py (standalone, uses subprocess only; contains ProjectDependencyManager)
 terminal_orchestrator.py ← multi_terminal.py, terminal_state_machine.py
 agent_error_handler.py ← error_detection.py (uses existing ErrorCategory and ErrorClassifier)
 system_prompt_builder.py ← tool_registry.py, execution_context.py
@@ -2910,6 +2915,17 @@ Update `agent_loop.py` to incorporate all Phase 16 capabilities:
 5. **In `process_message()`**, use `dual_model_router.get_router(ModelRole.LARGE)` for the main reasoning loop
 
 ---
+
+### New Files to Create
+
+| File | Phase | Description |
+|---|---|---|
+| `src/proxima/agent/dynamic_tools/intent_tool_bridge.py` | 3 | Central dispatcher mapping intents to tool executions |
+| `src/proxima/agent/dependency_manager.py` | 5 | ProjectDependencyManager for detecting and installing project dependencies |
+| `src/proxima/agent/terminal_orchestrator.py` | 9 | Unified terminal spawning, monitoring, and output management |
+| `src/proxima/agent/dynamic_tools/system_prompt_builder.py` | 10 | Constructs LLM system prompts with current state and capabilities |
+| `src/proxima/agent/dynamic_tools/agent_loop.py` | 10 | Core agentic loop replacing the single-shot response pipeline |
+| `src/proxima/agent/agent_error_handler.py` | 11 | Agent-specific error classification wrapping existing ErrorClassifier |
 | `src/proxima/tui/messages/agent_messages.py` | 14 | Custom Textual messages for inter-screen communication |
 | `tests/test_intent_recognition.py` | 13 | Intent recognition test suite |
 | `tests/test_e2e_agent.py` | 13 | End-to-end integration tests |
